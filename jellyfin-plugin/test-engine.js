@@ -103,7 +103,7 @@ sandbox.window.localStorage = makeStorage();
 sandbox.globalThis = sandbox;
 
 vm.createContext(sandbox);
-for (const f of ['bandersnatch.js', 'SegmentMap.js', 'choices-en.js', 'interactive-player.js']) {
+for (const f of ['bandersnatch.js', 'SegmentMap.js', 'choices-en.js', 'choices-es.js', 'interactive-player.js']) {
   vm.runInContext(fs.readFileSync(path.join(WEB, f), 'utf8'), sandbox, { filename: f });
 }
 
@@ -265,11 +265,42 @@ function showing() {
   const s = textTracks.filter((t) => t.mode === 'showing').map((t) => t.language);
   return s.length ? s[0] : null;
 }
-const subtitleSteps = [];
-for (let i = 0; i < 4; i++) {
-  pressS();
-  subtitleSteps.push(showing());
+function choiceText(segmentId, choiceId) {
+  const list = bnd.data.moments[segmentId] || [];
+  for (const m of list) {
+    for (const c of m.choices || []) {
+      if (c.id === choiceId) { return c.text; }
+    }
+  }
+  return null;
 }
+function caption() { return document.getElementById('caption').textContent; }
+
+// sit inside the cereal choice so a caption is on screen
+bnd.seek(136500);
+bnd.onTimeUpdate();
+check(caption() === 'Which Cereal?', `caption starts as "${caption()}"`);
+check(choiceText('2G', '1S') === 'THE BERMUDA TRIANGLE', 'labels start in English');
+
+const subtitleSteps = [];
+pressS();                                     // off -> es
+subtitleSteps.push(showing());
+check(choiceText('2G', '1S') === 'EL TRIÁNGULO DE LAS BERMUDAS',
+  `spanish labels expected, got ${choiceText('2G', '1S')}`);
+check(caption() === '¿Qué cereal?', `spanish caption expected, got "${caption()}"`);
+check(choiceText('1A', '1E') === 'SUGAR PUFFS', 'brand names are left as they are');
+
+pressS();                                     // es -> en
+subtitleSteps.push(showing());
+check(choiceText('2G', '1S') === 'THE BERMUDA TRIANGLE', 'labels return to English');
+check(caption() === 'Which Cereal?', 'caption returns to English');
+
+pressS();                                     // en -> off
+subtitleSteps.push(showing());
+check(choiceText('2G', '1S') === 'THE BERMUDA TRIANGLE', 'hiding subtitles keeps the labels');
+
+pressS();                                     // off -> es again
+subtitleSteps.push(showing());
 console.log('S cycles through: ' + subtitleSteps.map((x) => x || 'off').join(' -> '));
 check(subtitleSteps[0] === 'es', 'first S should select Español');
 check(subtitleSteps[1] === 'en', 'second S should select English');
