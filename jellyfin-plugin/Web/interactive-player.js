@@ -35,24 +35,59 @@
     return { id: id, start: segmentMap.segments[id].startTimeMs, end: segmentMap.segments[id].endTimeMs };
   }).sort(function (a, b) { return a.start - b.start; });
 
-  function translateChoiceTexts() {
-    var out = JSON.parse(JSON.stringify(momentsBySegment));
-    if (typeof en === 'undefined') { return out; }
-    for (var segment in en) {
-      var list = out[segment];
-      if (!list) { continue; }
+  // Choice labels and captions per language. The manifest is English; the
+  // other tables are translated separately, and anything a table does not
+  // cover falls back to English and then to the manifest text. The order here
+  // is also the order S walks through.
+  var CHOICE_TABLES = {
+    es: (typeof es !== 'undefined') ? es : {},
+    en: (typeof en !== 'undefined') ? en : {}
+  };
+  var CAPTION_TABLES = {
+    es: (typeof esCaptions !== 'undefined') ? esCaptions : {}
+  };
+  var choiceLang = 'en';
+
+  var moments = JSON.parse(JSON.stringify(momentsBySegment));
+
+  // Keep what the manifest itself said, so switching back always works.
+  function captureOriginalChoiceTexts() {
+    for (var segment in moments) {
+      var list = moments[segment] || [];
       for (var i = 0; i < list.length; i++) {
         var choices = list[i].choices;
         if (!choices) { continue; }
         for (var k = 0; k < choices.length; k++) {
           var c = choices[k];
-          if (c && c.id && en[segment] && (c.id in en[segment])) { c.text = en[segment][c.id]; }
+          if (c && c.text && c.originalText === undefined) { c.originalText = c.text; }
         }
       }
     }
-    return out;
   }
-  var moments = translateChoiceTexts();
+
+  function applyChoiceLanguage(lang) {
+    var table = CHOICE_TABLES[lang] || {};
+    var english = CHOICE_TABLES.en || {};
+    for (var segment in moments) {
+      var list = moments[segment] || [];
+      for (var i = 0; i < list.length; i++) {
+        var choices = list[i].choices;
+        if (!choices) { continue; }
+        for (var k = 0; k < choices.length; k++) {
+          var c = choices[k];
+          if (!c || !c.id) { continue; }
+          c.text = (table[segment] && table[segment][c.id]) ||
+                   (english[segment] && english[segment][c.id]) ||
+                   c.originalText || c.text;
+        }
+      }
+    }
+    choiceLang = CHOICE_TABLES[lang] ? lang : 'en';
+    if (currentMoment) { renderChoices(currentMoment); }  // switch what is on screen
+  }
+
+  captureOriginalChoiceTexts();
+  applyChoiceLanguage('en');
 
   /* --------------------------------------------------------------- storage */
 
@@ -287,6 +322,13 @@
     barEl.style.width = '0%';
   }
 
+  function captionText(moment) {
+    var point = moment.id ? choicePoints[moment.id] : null;
+    if (!point || !point.description) { return ''; }
+    var table = CAPTION_TABLES[choiceLang];
+    return (table && table[point.description]) || point.description;
+  }
+
   function renderChoices(moment) {
     clearChoices();
     selectedChoice = moment.defaultChoiceIndex || 0;
@@ -316,8 +358,9 @@
       choicesEl.className = 'on';
     }
 
-    if (moment.id && choicePoints[moment.id] && choicePoints[moment.id].description) {
-      captionEl.textContent = choicePoints[moment.id].description;
+    var caption = captionText(moment);
+    if (caption) {
+      captionEl.textContent = caption;
       captionEl.className = 'on';
     }
     paintSelection();
@@ -601,6 +644,9 @@
     for (i = 0; i < tracks.length; i++) {
       tracks[i].mode = tracks[i].language === next ? 'showing' : 'hidden';
     }
+    // The story's own wording follows the subtitles. Turning them off leaves
+    // the labels alone rather than snapping back to English.
+    if (next) { applyChoiceLanguage(next); }
     toast(next ? subtitleLabel(next) : 'Subtitles off');
     updateHud();
     return next;
@@ -732,6 +778,8 @@
     getSegmentId: getSegmentId, getSegmentMs: getSegmentMs, getMoments: getMoments,
     playSegment: function (id) { segmentTransition = true; return playSegment(id); },
     playNextSegment: playNextSegment, choose: choose, seek: seek,
+    applyChoiceLanguage: applyChoiceLanguage,
+    subtitleLanguage: function () { return choiceLang; },
     onTimeUpdate: onTimeUpdate, jumpForward: jumpForward, jumpBack: jumpBack,
     getSegment: function () { return currentSegment; },
     getState: function () { return { segment: currentSegment, prev: prevSegment, ms: getCurrentMs() }; },
