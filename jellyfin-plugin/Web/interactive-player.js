@@ -704,7 +704,11 @@
   });
   video.addEventListener('dblclick', toggleFullscreen);
   video.addEventListener('timeupdate', function () { onTimeUpdate(); });
-  video.addEventListener('playing', function () { toastEl.className = ''; });
+  video.addEventListener('playing', function () {
+    // Playback can start without a click (autoplay allowed), so the cover goes
+    // away on the first frame rather than waiting for a gesture.
+    startEl.className = 'hide';
+  });
 
   /* ------------------------------------------------------------------- boot */
 
