@@ -55,7 +55,7 @@ Player URL: `/InteractiveVideo/Player/{ItemId}`, with deep links
 | `↑` `↓` | Speed up/slow down playbook |
 | `0` | Reset speed to 1.0x |
 | `Enter` | Select highlighted choice |
-| `S` | Toggle subtitles |
+| `S` | Cycle subtitles (off → Español → English) |
 
 ## 🛠️ Requirements
 
