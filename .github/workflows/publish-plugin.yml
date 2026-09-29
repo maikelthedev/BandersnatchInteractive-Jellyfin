@@ -24,7 +24,7 @@ jobs:
     - name: Setup .NET
       uses: actions/setup-dotnet@v4
       with:
-        dotnet-version: 6.0.x
+        dotnet-version: 10.0.x
 
     - name: Build plugin
       run: |
@@ -62,7 +62,7 @@ jobs:
           VERSION="${{ github.event.release.tag_name }}"
           CHANGELOG="${{ github.event.release.body }}"
         else
-          VERSION="1.1.2"
+          VERSION="1.2.0"
           CHANGELOG="Automated build - Enhanced repository structure with proper manifest.json support for Jellyfin plugin repositories"
         fi
         
