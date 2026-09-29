@@ -10,10 +10,10 @@
   #stage { position: fixed; inset: 0; background: #000; }
   video { position: absolute; inset: 0; width: 100%; height: 100%; background: #000;
           object-fit: contain; outline: none; }
-  /* Readable captions over the black bars, and small enough that two lines
-     still fit in the band the choice UI leaves for them. */
-  video::cue { font-size: 1.35rem; background: rgba(0, 0, 0, .7);
-               text-shadow: 0 1px 2px rgba(0,0,0,.9); }
+  /* Readable captions over the black bars. The size stays the browser's own
+     (which scales with the picture); clearing space for it is the layout's job,
+     not the font's. */
+  video::cue { background: rgba(0, 0, 0, .7); text-shadow: 0 1px 2px rgba(0,0,0,.9); }
 
   /* ---------- choice overlay ----------
      The browser draws the subtitles in the bottom strip of the video, so the
@@ -40,10 +40,11 @@
 
   /* While a subtitle line is on screen, everything of ours steps up so the
      bottom band belongs to the subtitles alone - the browser draws cues at the
-     bottom of the video and they cannot be moved. */
-  #stage.subs-on #choices { bottom: 21vh; }
-  #stage.subs-on #caption { bottom: 16vh; }
-  #stage.subs-on #keypad { bottom: 18vh; }
+     bottom of the video and they cannot be moved. Two lines of the default cue
+     size reach about 19vh up, so the prompt clears that. */
+  #stage.subs-on #choices { bottom: 25vh; }
+  #stage.subs-on #caption { bottom: 20vh; }
+  #stage.subs-on #keypad { bottom: 22.5vh; }
 
   /* ---------- phone code (take the phone number) ---------- */
   #keypad { position: absolute; left: 50%; bottom: 12vh; transform: translateX(-50%); display: none;
