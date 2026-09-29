@@ -44,6 +44,18 @@ This fork was rebuilt and reworked against a live **Jellyfin 12.1**:
   rendition in the library — the player picks it automatically when both exist.
 * `jellyfin-plugin/test-engine.js` (node) walks the whole story graph against the
   real data and asserts every automatic transition is a legal successor.
+* `jellyfin-plugin/test-coverage.js` (node) pins the interactive surface: it
+  plays every one of the 174 choice points, checks what is on screen there
+  (buttons, keypad, labels) and that each of the 339 options branches where the
+  manifest says it should. Run both with `node test-engine.js && node test-coverage.js`.
+* **The film's random variations are not implemented.** 63 of the 250 segments are
+  only reachable through a weighted `next` list, which the manifest uses when the
+  viewer makes no choice and Netflix resolved by picking at random - the `Z*` and
+  `SS*` shuffle families, and the four extra dial variants of the P.A.C.S. phone
+  scene. The engine always takes `defaultNext` there (as the reference player
+  does), so the same variant comes up every time. Restoring the random pick needs
+  care: each dial variant shows a different number on screen, and the keypad only
+  knows the one the default variant shows.
 
 Player URL: `/InteractiveVideo/Player/{ItemId}`, with deep links
 `#<segmentId>`, `#<segmentId>/<momentIndex>` and `#t<seconds>`.
