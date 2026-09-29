@@ -57,19 +57,28 @@ video.paused = true;
 video.duration = 18734.24;
 video.videoWidth = 1920;
 video.videoHeight = 1080;
-video.textTracks = [{ mode: 'hidden' }];
+const textTracks = [];
+video.textTracks = textTracks;
+const realAppend = video.appendChild.bind(video);
+video.appendChild = function (child) {
+  if (child && child.srclang) {
+    textTracks.push({ language: child.srclang, label: child.label, kind: child.kind, mode: 'hidden' });
+  }
+  return realAppend(child);
+};
 video.play = function () { this.paused = false; };
 video.pause = function () { this.paused = true; };
 video.load = function () {};
 elements.video = video;
 
+const docListeners = {};
 const document = {
   title: '',
   getElementById: (id) => (id === 'video' ? video : el(id)),
   createElement: (t) => makeEl(t),
   querySelector: () => null,
   querySelectorAll: () => [],
-  addEventListener: () => {},
+  addEventListener: (t, f) => { (docListeners[t] = docListeners[t] || []).push(f); },
   fullscreenElement: null,
   exitFullscreen: () => {}
 };
@@ -241,6 +250,32 @@ reset();
 const noChoiceTarget = advanceUntilSegmentChange(0, 200000);
 console.log('no choice at the first decision -> ' + noChoiceTarget + ' (expected 1E)');
 check(noChoiceTarget === '1E', `default path after 1A is ${noChoiceTarget}, expected 1E`);
+
+/* ---------------------------------------------------- subtitle cycling */
+check(textTracks.length === 2, `expected 2 subtitle tracks, got ${textTracks.length}`);
+check(textTracks.map((t) => t.language).join(',') === 'es,en',
+  `subtitle order is ${textTracks.map((t) => t.language).join(',')}`);
+check(textTracks.map((t) => t.label).join(',') === 'Español,English',
+  `subtitle labels are ${textTracks.map((t) => t.label).join(',')}`);
+
+function pressS() {
+  (docListeners.keydown || []).forEach((f) => f({ code: 'KeyS', preventDefault() {}, stopPropagation() {} }));
+}
+function showing() {
+  const s = textTracks.filter((t) => t.mode === 'showing').map((t) => t.language);
+  return s.length ? s[0] : null;
+}
+const subtitleSteps = [];
+for (let i = 0; i < 4; i++) {
+  pressS();
+  subtitleSteps.push(showing());
+}
+console.log('S cycles through: ' + subtitleSteps.map((x) => x || 'off').join(' -> '));
+check(subtitleSteps[0] === 'es', 'first S should select Español');
+check(subtitleSteps[1] === 'en', 'second S should select English');
+check(subtitleSteps[2] === null, 'third S should turn subtitles off');
+check(subtitleSteps[3] === 'es', 'fourth S should come back to Español');
+check(textTracks.filter((t) => t.mode === 'showing').length <= 1, 'only one track shows at a time');
 
 /* ------------------------------------------------------- boundary sanity */
 check(bnd.getSegmentId(0) === '1A', 't=0 should be segment 1A');
