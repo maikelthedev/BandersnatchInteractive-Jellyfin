@@ -154,7 +154,7 @@ Replace `{ItemId}` with your Bandersnatch video's Item ID.
 1. The video will load automatically from Jellyfin
 2. Click the play button when prompted (browser autoplay policy)
 3. Use keyboard controls to navigate
-4. Press `S` to toggle English subtitles
+4. Press `S` to cycle subtitles: off → Español → English
 5. Enjoy the interactive experience!
 
 ## 🎯 How It Works
