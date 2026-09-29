@@ -211,6 +211,27 @@ cd jellyfin-plugin
 ./build.sh
 ```
 
+### Secret scan
+
+Two checks, one before the objects leave a machine and one on every push:
+
+* `.githooks/pre-push` runs trufflehog over the whole history (every ref, so a
+  secret on any branch counts) and aborts the push if it finds anything. Git
+  does not fetch hooks with a clone, so activate it once per clone:
+
+  ```bash
+  git config core.hooksPath .githooks
+  ```
+
+* `.github/workflows/secret-scan.yml` does the same on every push and pull
+  request, with the full history (`fetch-depth: 0`). Separate from the release
+  workflow on purpose: that one only runs when a release is published, which is
+  far too late to be hearing about a credential.
+
+Both fail on verified *and* unverified hits - an unverified hit is something to
+explain, not to wave through. Overrides are deliberately explicit:
+`git push --no-verify` or `TRUFFLEHOG_SKIP=1 git push`.
+
 ### Debugging
 
 The plugin includes extensive console logging. Open browser developer tools to see:
