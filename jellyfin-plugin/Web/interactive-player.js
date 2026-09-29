@@ -546,10 +546,14 @@
   }
 
   function updateHud() {
+    // Diagnostic only: the chapter/speed readout is for debugging, not for
+    // watching. It is shown with ?debug=1 and never otherwise.
+    if (!DEBUG) { return; }
     hudSegEl.textContent = currentSegment ? ('CHAPTER ' + currentSegment) : '';
-    if (!barShown && currentSegment) { hudEl.className = 'on'; }
+    hudSpeedEl.textContent = video.playbackRate !== 1 ? video.playbackRate + 'x' : '';
+    hudEl.className = currentSegment ? 'on' : '';
+    document.title = currentSegment + ' · ' + Math.round(getCurrentMs() / 1000) + 's · ' + video.videoWidth + 'x' + video.videoHeight;
   }
-  var barShown = false;
 
   /* ---------------------------------------------------------------- controls */
 
@@ -561,6 +565,7 @@
     video.playbackRate = speedSteps[speedIndex];
     hudSpeedEl.textContent = video.playbackRate + 'x';
     toast(video.playbackRate + 'x');
+    updateHud();
   }
 
   function toggleFullscreen() {
@@ -622,7 +627,7 @@
   });
   video.addEventListener('dblclick', toggleFullscreen);
   video.addEventListener('timeupdate', function () { onTimeUpdate(); });
-  video.addEventListener('playing', function () { hudEl.className = 'on'; barShown = true; });
+  video.addEventListener('playing', function () { toastEl.className = ''; });
 
   /* ------------------------------------------------------------------- boot */
 
@@ -659,7 +664,6 @@
 
     startEl.addEventListener('click', function () {
       startEl.className = 'hide';
-      barShown = true;
       video.play();
       if (!lastSegment) { playSegment(segmentMap.initialSegment); }
     });
