@@ -66,39 +66,6 @@ namespace Jellyfin.Plugin.InteractiveVideo.Api
         }
 
         /// <summary>
-        /// Gets the interactive metadata for a specific media item.
-        /// </summary>
-        /// <param name="itemId">The media item ID.</param>
-        /// <returns>The interactive metadata JSON.</returns>
-        [HttpGet("Metadata/{itemId}")]
-        [AllowAnonymous]
-        [Produces(MediaTypeNames.Application.Json)]
-        public ActionResult GetInteractiveMetadata([FromRoute, Required] string itemId)
-        {
-            try
-            {
-                var assembly = Assembly.GetExecutingAssembly();
-                var resourceName = "Jellyfin.Plugin.InteractiveVideo.Web.bandersnatch-metadata.json";
-                
-                using var stream = assembly.GetManifestResourceStream(resourceName);
-                if (stream == null)
-                {
-                    return NotFound("Metadata not found");
-                }
-
-                using var reader = new StreamReader(stream);
-                var json = reader.ReadToEnd();
-                
-                return Content(json, "application/json");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error serving interactive metadata for item {ItemId}", itemId);
-                return StatusCode(500, "Internal server error");
-            }
-        }
-
-        /// <summary>
         /// Gets static assets for the interactive player.
         /// </summary>
         /// <param name="filename">The asset filename.</param>
@@ -120,6 +87,8 @@ namespace Jellyfin.Plugin.InteractiveVideo.Api
 
                 var contentType = filename.EndsWith(".js") ? "application/javascript" :
                                 filename.EndsWith(".css") ? "text/css" :
+                                filename.EndsWith(".html") ? "text/html" :
+                                filename.EndsWith(".json") ? "application/json" :
                                 filename.EndsWith(".vtt") ? "text/vtt" :
                                 "application/octet-stream";
 
