@@ -22,6 +22,10 @@ Upstream was written against Jellyfin 10.8 and only ever shipped a five-choice s
 of the interactive manifest, so on a current server it could not branch the story.
 This fork was rebuilt and reworked against a live **Jellyfin 12.1**:
 
+* **Translated labels.** The 335 choice labels and 30 captions come from the
+  manifest in English; `Web/choices-es.js` carries a Spanish table (wording
+  matched to the official Spanish subtitles, brand names and the codes you type
+  left alone) and the player follows whichever subtitle language you select.
 * **Real branching.** `Web/bandersnatch.js` + `Web/SegmentMap.js` carry the full
   interactive manifest (250 segments, 174 choice moments, 241 preconditions, 111
   segment groups) and `Web/interactive-player.js` implements the engine: segment
@@ -55,7 +59,7 @@ Player URL: `/InteractiveVideo/Player/{ItemId}`, with deep links
 | `↑` `↓` | Speed up/slow down playbook |
 | `0` | Reset speed to 1.0x |
 | `Enter` | Select highlighted choice |
-| `S` | Cycle subtitles (off → Español → English) |
+| `S` | Cycle subtitles (off → Español → English); the choice labels and their captions follow the language you pick |
 
 ## 🛠️ Requirements
 
