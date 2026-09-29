@@ -10,10 +10,16 @@
   #stage { position: fixed; inset: 0; background: #000; }
   video { position: absolute; inset: 0; width: 100%; height: 100%; background: #000;
           object-fit: contain; outline: none; }
+  /* Readable captions over the black bars, and small enough that two lines
+     still fit in the band the choice UI leaves for them. */
+  video::cue { font-size: 1.35rem; background: rgba(0, 0, 0, .7);
+               text-shadow: 0 1px 2px rgba(0,0,0,.9); }
 
-  /* ---------- choice overlay ---------- */
+  /* ---------- choice overlay ----------
+     The browser draws the subtitles in the bottom strip of the video, so the
+     choices and their prompt sit above it rather than in the same place. */
   #overlay { position: absolute; inset: 0; pointer-events: none; z-index: 10; }
-  #choices { position: absolute; left: 0; right: 0; bottom: 9vh; display: none;
+  #choices { position: absolute; left: 0; right: 0; bottom: 15vh; display: none;
              justify-content: center; align-items: stretch; gap: 1.2rem; padding: 0 4vw;
              pointer-events: auto; flex-wrap: wrap; }
   #choices.on { display: flex; }
@@ -24,7 +30,7 @@
   .choice:hover { border-color: #fff; }
   .choice.sel { background: #fff; color: #000; border-color: #fff; transform: scale(1.04); }
 
-  #caption { position: absolute; left: 0; right: 0; bottom: 4.5vh; text-align: center;
+  #caption { position: absolute; left: 0; right: 0; bottom: 10vh; text-align: center;
              font-size: .95rem; letter-spacing: .18em; text-transform: uppercase;
              color: rgba(255,255,255,.75); display: none; }
   #caption.on { display: block; }
@@ -32,8 +38,15 @@
   #bar { position: absolute; left: 0; bottom: 0; height: 3px; background: #e50914; width: 0;
          transition: width .15s linear; }
 
+  /* While a subtitle line is on screen, everything of ours steps up so the
+     bottom band belongs to the subtitles alone - the browser draws cues at the
+     bottom of the video and they cannot be moved. */
+  #stage.subs-on #choices { bottom: 21vh; }
+  #stage.subs-on #caption { bottom: 16vh; }
+  #stage.subs-on #keypad { bottom: 18vh; }
+
   /* ---------- phone code (take the phone number) ---------- */
-  #keypad { position: absolute; left: 50%; bottom: 8vh; transform: translateX(-50%); display: none;
+  #keypad { position: absolute; left: 50%; bottom: 12vh; transform: translateX(-50%); display: none;
             background: rgba(0,0,0,.85); border: 1px solid rgba(255,255,255,.35); padding: 1rem 1.2rem;
             border-radius: 6px; pointer-events: auto; text-align: center; }
   #keypad.on { display: block; }

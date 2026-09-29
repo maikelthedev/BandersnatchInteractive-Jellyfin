@@ -199,6 +199,7 @@
   /* -------------------------------------------------------------------- dom */
 
   var video = document.getElementById('video');
+  var stageEl = document.getElementById('stage');
   var choicesEl = document.getElementById('choices');
   var captionEl = document.getElementById('caption');
   var barEl = document.getElementById('bar');
@@ -641,15 +642,50 @@
       }
       if (i === SUBTITLES.length) { next = SUBTITLES[0].lang; }
     }
-    for (i = 0; i < tracks.length; i++) {
-      tracks[i].mode = tracks[i].language === next ? 'showing' : 'hidden';
+    selectSubtitle(next);
+    toast(next ? subtitleLabel(next) : 'Subtitles off');
+    return next;
+  }
+
+  // One place decides the track modes, so the query string can use it too.
+  var subtitleAliases = {
+    off: null, none: null, no: null,
+    es: 'es', 'es-es': 'es', espanol: 'es', 'español': 'es', spanish: 'es',
+    en: 'en', english: 'en'
+  };
+
+  function selectSubtitle(lang) {
+    var tracks = video.textTracks || [];
+    for (var i = 0; i < tracks.length; i++) {
+      tracks[i].mode = tracks[i].language === lang ? 'showing' : 'hidden';
     }
     // The story's own wording follows the subtitles. Turning them off leaves
     // the labels alone rather than snapping back to English.
-    if (next) { applyChoiceLanguage(next); }
-    toast(next ? subtitleLabel(next) : 'Subtitles off');
+    if (lang) { applyChoiceLanguage(lang); }
+    refreshSubtitleBand();
     updateHud();
-    return next;
+    return lang;
+  }
+
+  // Cues are drawn at the bottom of the video by the browser, where they would
+  // sit under the choices; while one is on screen the choice UI lifts clear.
+  function refreshSubtitleBand() {
+    var tracks = video.textTracks || [];
+    var showing = false;
+    for (var i = 0; i < tracks.length; i++) {
+      if (tracks[i].mode === 'showing' && tracks[i].activeCues && tracks[i].activeCues.length) {
+        showing = true;
+      }
+    }
+    if (stageEl) { stageEl.className = showing ? 'subs-on' : ''; }
+  }
+
+  // ?subs=es (or en/off) preselects a track, so a link can be shared in Spanish.
+  function requestedSubtitle() {
+    var m = location.search.match(/[?&]subs=([^&]+)/);
+    if (!m) { return undefined; }
+    var want = decodeURIComponent(m[1]).toLowerCase();
+    return want in subtitleAliases ? subtitleAliases[want] : undefined;
   }
 
   function subtitleLabel(lang) {
@@ -708,6 +744,7 @@
     // Playback can start without a click (autoplay allowed), so the cover goes
     // away on the first frame rather than waiting for a gesture.
     startEl.className = 'hide';
+    refreshSubtitleBand();
   });
 
   /* ------------------------------------------------------------------- boot */
@@ -744,6 +781,17 @@
       track.srclang = SUBTITLES[s].lang;
       track.src = SUBTITLES[s].src;
       video.appendChild(track);
+      // cuechange fires on the TextTrack, not on the element we appended.
+      var textTrack = video.textTracks && video.textTracks[video.textTracks.length - 1];
+      if (textTrack && textTrack.addEventListener) {
+        textTrack.addEventListener('cuechange', refreshSubtitleBand);
+      }
+    }
+
+    var wanted = requestedSubtitle();
+    if (wanted !== undefined) {
+      selectSubtitle(wanted);
+      if (wanted) { toast(subtitleLabel(wanted)); }
     }
 
     startEl.addEventListener('click', function () {
