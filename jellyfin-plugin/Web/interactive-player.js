@@ -1,1074 +1,704 @@
-/**
- * Jellyfin Interactive Video Player
- * Based on the original BandersnatchInteractive player
+/*!
+ * Bandersnatch interactive engine for Jellyfin.
+ *
+ * The branching logic (segment map, moments, preconditions, breadcrumbs,
+ * segment groups, state history) is a port of the original public-domain
+ * BandersnatchInteractive player (https://github.com/joric/bandersnatch),
+ * adapted to play the video that Jellyfin already has in its library.
+ *
+ * Public domain / Unlicense, same as the original.
  */
+(function () {
+  'use strict';
 
-class JellyfinInteractivePlayer {
-    constructor(itemId) {
-        this.itemId = itemId;
-        this.video = null;
-        this.interactiveData = null;
-        this.segmentMap = null;
-        this.currentSegment = null;
-        this.state = {};
-        this.choiceTimeout = null;
-        this.selectedChoice = 0;
-        this.isChoiceActive = false;
-        this.momentsBySegment = null;
-        this.choicePoints = null;
-        this.segmentGroups = null;
-        this.lastChoiceShown = null;
-        
-        // Playback speed steps
-        this.speedSteps = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
-        this.currentSpeedIndex = 3; // Start at 1.0x (index 3)
-        
-        // UI elements
-        this.choicesContainer = null;
-        this.timerElement = null;
-        this.countdownElement = null;
-        this.progressBar = null;
-        this.loadingElement = null;
-        this.errorElement = null;
-        
-        // Persistent state using localStorage
-        this.ls = window.localStorage || {};
-        
-        this.init();
-    }
-    
-    async init() {
-        try {
-            await this.loadInteractiveData();
-            this.setupUI();
-            this.setupVideo();
-            this.setupEventListeners();
-            this.initializeState();
-            
-            console.log('Interactive player initialized successfully');
-        } catch (error) {
-            this.showError('Failed to initialize: ' + error.message);
-            console.error('Init error:', error);
+  var DEBUG = /[?&]debug=1/.test(location.search);
+  var VIDEO_ID = '80988062';           // Netflix id of the interactive manifest
+  var SUBTITLE_URL = '/InteractiveVideo/Subtitles/en';
+  var RESUME = true;                   // remember where we were across sessions
+
+  /* ------------------------------------------------------------------ data */
+
+  var interactive = bandersnatch.videos[VIDEO_ID].interactiveVideoMoments.value;
+  var segmentMap = SegmentMap;
+  var choicePoints = interactive.choicePointNavigatorMetadata.choicePointsMetadata.choicePoints;
+  var momentsBySegment = interactive.momentsBySegment;
+  var segmentGroups = interactive.segmentGroups;
+  var preconditions = interactive.preconditions;
+
+  // Sorted segment table for a fast timestamp -> segment lookup.
+  var segmentIds = Object.keys(segmentMap.segments);
+  var segmentOrder = segmentIds.map(function (id) {
+    return { id: id, start: segmentMap.segments[id].startTimeMs, end: segmentMap.segments[id].endTimeMs };
+  }).sort(function (a, b) { return a.start - b.start; });
+
+  function translateChoiceTexts() {
+    var out = JSON.parse(JSON.stringify(momentsBySegment));
+    if (typeof en === 'undefined') { return out; }
+    for (var segment in en) {
+      var list = out[segment];
+      if (!list) { continue; }
+      for (var i = 0; i < list.length; i++) {
+        var choices = list[i].choices;
+        if (!choices) { continue; }
+        for (var k = 0; k < choices.length; k++) {
+          var c = choices[k];
+          if (c && c.id && en[segment] && (c.id in en[segment])) { c.text = en[segment][c.id]; }
         }
+      }
     }
-    
-    async loadInteractiveData() {
-        try {
-            const response = await fetch(`/InteractiveVideo/Metadata/${this.itemId}`);
-            if (!response.ok) {
-                throw new Error('Failed to load metadata');
-            }
-            
-            const data = await response.json();
-            this.interactiveData = data;
-            
-            // Extract components (simplified from original structure)
-            this.choicePoints = data.choicePoints || {};
-            this.segmentMap = data.segments || {};
-            this.momentsBySegment = this.buildMomentsBySegment();
-            
-            console.log('Interactive data loaded:', data);
-        } catch (error) {
-            console.error('Error loading interactive data:', error);
-            throw error;
+    return out;
+  }
+  var moments = translateChoiceTexts();
+
+  /* --------------------------------------------------------------- storage */
+
+  var ls = window.localStorage;
+  var KEY = 'bnd.';
+  function get(k, fallback) {
+    var v = ls.getItem(KEY + k);
+    if (v === null) { return fallback; }
+    try { return JSON.parse(v); } catch (e) { return v; }
+  }
+  function set(k, v) { try { ls.setItem(KEY + k, JSON.stringify(v)); } catch (e) { /* ignore */ } }
+  function clearState() {
+    var keys = [];
+    for (var i = 0; i < ls.length; i++) {
+      var k = ls.key(i);
+      if (k && k.indexOf(KEY) === 0) { keys.push(k); }
+    }
+    keys.forEach(function (k) { ls.removeItem(k); });
+  }
+  if (!get('initialized')) {
+    for (var sv in interactive.stateHistory) {
+      set('persistentState_' + sv, interactive.stateHistory[sv]);
+    }
+    set('initialized', true);
+  }
+
+  /* ---------------------------------------------------------- preconditions */
+
+  function preconditionToJS(cond) {
+    if (cond === true) { return 'true'; }
+    if (cond === false) { return 'false'; }
+    if (typeof cond === 'string') { return JSON.stringify(cond); }
+    if (typeof cond === 'number') { return String(cond); }
+    if (!cond || !cond.length) { return 'true'; }
+    switch (cond[0]) {
+      case 'persistentState': return 'get("persistentState_' + cond[1] + '")';
+      case 'not': return '!(' + preconditionToJS(cond[1]) + ')';
+      case 'and': return '(' + cond.slice(1).map(preconditionToJS).join(' && ') + ')';
+      case 'or': return '(' + cond.slice(1).map(preconditionToJS).join(' || ') + ')';
+      case 'eql':
+        if (cond.length === 3) { return '(' + cond.slice(1).map(preconditionToJS).join(' === ') + ')'; }
+        break;
+    }
+    log('unsupported precondition', cond);
+    return 'true';
+  }
+
+  function evalPrecondition(precondition) {
+    if (precondition === undefined || precondition === null) { return true; }
+    try {
+      return !!eval(preconditionToJS(precondition)); // eslint-disable-line no-eval
+    } catch (e) {
+      log('precondition failed to evaluate', precondition, e);
+      return true;
+    }
+  }
+  function checkPrecondition(id) { return evalPrecondition(preconditions[id]); }
+
+  function resolveSegmentGroup(group) {
+    var list = segmentGroups[group] || [];
+    for (var i = 0; i < list.length; i++) {
+      var v = list[i];
+      if (v.precondition && !checkPrecondition(v.precondition)) { continue; }
+      if (v.segmentGroup) { return resolveSegmentGroup(v.segmentGroup); }
+      if (v.segment) { return v.segment; }
+      if (!checkPrecondition(v)) { continue; }
+      return v;
+    }
+    return null;
+  }
+
+  /* ------------------------------------------------------------ engine core */
+
+  function getSegmentId(ms) {
+    var lo = 0, hi = segmentOrder.length - 1;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      var s = segmentOrder[mid];
+      if (ms < s.start) { hi = mid - 1; }
+      else if (s.end && ms >= s.end) { lo = mid + 1; }
+      else { return s.id; }
+    }
+    return null;
+  }
+  function getSegmentMs(id) { return segmentMap.segments[id].startTimeMs; }
+
+  function getMoments(segmentId, ms) {
+    var result = {};
+    var list = moments[segmentId] || [];
+    for (var i = 0; i < list.length; i++) {
+      var m = list[i];
+      if (ms >= m.startMs && ms < m.endMs && evalPrecondition(m.precondition)) {
+        result[segmentId + '/' + i] = m;
+      }
+    }
+    return result;
+  }
+
+  function applyImpression(impressionData) {
+    if (!impressionData || impressionData.type !== 'userState') { return; }
+    var data = impressionData.data && impressionData.data.persistent;
+    if (!data) { return; }
+    for (var variable in data) {
+      set('persistentState_' + variable, data[variable]);
+      log('persistentState', variable, '=', data[variable]);
+    }
+  }
+
+  /* -------------------------------------------------------------------- dom */
+
+  var video = document.getElementById('video');
+  var choicesEl = document.getElementById('choices');
+  var captionEl = document.getElementById('caption');
+  var barEl = document.getElementById('bar');
+  var keypadEl = document.getElementById('keypad');
+  var slotsEl = document.getElementById('slots');
+  var startEl = document.getElementById('start');
+  var msgEl = document.getElementById('msg');
+  var toastEl = document.getElementById('toast');
+  var hudSegEl = document.getElementById('hud-seg');
+  var hudSpeedEl = document.getElementById('hud-speed');
+  var hudEl = document.getElementById('hud');
+
+  function log() {
+    if (!DEBUG) { return; }
+    var args = Array.prototype.slice.call(arguments);
+    args.unshift('[bandersnatch]');
+    console.log.apply(console, args);
+  }
+  function showMessage(text) { msgEl.textContent = text; msgEl.className = 'on'; }
+  var toastTimer = 0;
+  function toast(text) {
+    toastEl.textContent = text;
+    toastEl.className = 'on';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toastEl.className = ''; }, 1200);
+  }
+
+  /* ------------------------------------------------------- jellyfin streaming */
+
+  function getToken() {
+    try {
+      var raw = ls.getItem('jellyfin_credentials');
+      if (raw) {
+        var creds = JSON.parse(raw);
+        var servers = creds.Servers || [];
+        var best = null;
+        for (var i = 0; i < servers.length; i++) {
+          var s = servers[i];
+          if (!s.AccessToken) { continue; }
+          if (!best) { best = s; }
+          var addr = (s.ManualAddress || s.Address || '');
+          if (addr && location.href.indexOf(addr.replace(/\/$/, '')) === 0) { best = s; break; }
         }
+        if (best) { return best.AccessToken; }
+      }
+    } catch (e) { /* fall through */ }
+    var m = location.search.match(/[?&]api_key=([^&]+)/);
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+
+  var token = getToken();
+
+  function api(path) {
+    var sep = path.indexOf('?') === -1 ? '?' : '&';
+    var url = path + (token ? sep + 'api_key=' + encodeURIComponent(token) : '');
+    return fetch(url, { headers: token ? { Authorization: 'MediaBrowser Token="' + token + '"' } : {} })
+      .then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status + ' for ' + path); } return r.json(); });
+  }
+
+  // Pick the rendition the browser can actually play: h264/mp4 first, then
+  // any h264, then anything (the caller may then rely on the browser).
+  function rankSource(src) {
+    var v = (src.MediaStreams || []).filter(function (s) { return s.Type === 'Video'; })[0] || {};
+    var codec = (v.Codec || '').toLowerCase();
+    var container = (src.Container || '').toLowerCase();
+    var score = 0;
+    if (codec === 'h264') { score += 100; }
+    else if (codec === 'vp9' || codec === 'vp8' || codec === 'av1') { score += 80; }
+    else if (codec === 'hevc' || codec === 'h265') { score += 10; }
+    if (container === 'mp4' || container === 'm4v' || container === 'webm') { score += 50; }
+    return score;
+  }
+
+  function resolveStreamUrl(itemId) {
+    return api('/Items/' + itemId + '?Fields=MediaSources')
+      .then(function (item) {
+        var sources = item.MediaSources || [];
+        if (!sources.length) { throw new Error('item has no media sources'); }
+        sources.sort(function (a, b) { return rankSource(b) - rankSource(a); });
+        var chosen = sources[0];
+        log('media sources', sources.map(function (s) {
+          return { id: s.Id, container: s.Container, name: s.Name, score: rankSource(s) };
+        }));
+        var base = '/Videos/' + itemId + '/stream?static=true&mediaSourceId=' + encodeURIComponent(chosen.Id);
+        if (token) { base += '&api_key=' + encodeURIComponent(token); }
+        return { url: base, container: chosen.Container, source: chosen };
+      })
+      .catch(function (e) {
+        log('PlaybackInfo lookup failed, falling back to the item id', e);
+        var base = '/Videos/' + itemId + '/stream?static=true&mediaSourceId=' + encodeURIComponent(itemId);
+        if (token) { base += '&api_key=' + encodeURIComponent(token); }
+        return { url: base, container: null, source: null };
+      });
+  }
+
+  /* ------------------------------------------------------------------- ui */
+
+  var slots = [];
+  function renderSlots() {
+    var out = [];
+    for (var i = 0; i < 5; i++) { out.push(slots[i] === undefined ? '-' : slots[i]); }
+    slotsEl.textContent = out.join(' ');
+  }
+  function pressDigit(d) {
+    if (slots.length >= 5) { return; }
+    slots.push(d);
+    renderSlots();
+    if (slots.length === 5) {
+      var code = slots.join('');
+      var idx = code === '20541' ? 0 : 1;
+      log('phone code', code, '-> choice', idx);
+      choose(idx);
     }
-    
-    buildMomentsBySegment() {
-        // Convert choice points to moments by segment
-        const moments = {};
-        
-        for (const [choiceId, choiceData] of Object.entries(this.choicePoints)) {
-            const segmentId = this.getSegmentIdAtTime(choiceData.startTimeMs);
-            if (!segmentId) continue;
-            
-            if (!moments[segmentId]) {
-                moments[segmentId] = [];
-            }
-            
-            moments[segmentId].push({
-                startMs: choiceData.startTimeMs - this.segmentMap[segmentId].startTimeMs,
-                endMs: choiceData.startTimeMs - this.segmentMap[segmentId].startTimeMs + (choiceData.timeout || 10000),
-                choices: choiceData.choices.map((choice, index) => ({
-                    id: choiceData.choiceIds[index],
-                    text: choice
-                })),
-                description: choiceData.description
-            });
-        }
-        
-        return moments;
-    }
-    
-    getSegmentIdAtTime(timeMs) {
-        for (const [segmentId, segment] of Object.entries(this.segmentMap)) {
-            if (timeMs >= segment.startTimeMs && timeMs < segment.endTimeMs) {
-                return segmentId;
-            }
-        }
-        return null;
-    }
-    
-    setupUI() {
-        const container = document.getElementById('video-container') || this.createVideoContainer();
-        
-        // Use existing video element or create new one
-        this.video = document.getElementById('video') || document.createElement('video');
-        this.video.id = 'video'; // Match the CSS in player.html
-        this.video.style.cssText = `
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: black;
-            z-index: 100;
-            object-fit: contain;
-            display: block;
-        `;
-        this.video.preload = 'metadata';
-        this.video.controls = false;
-        this.video.setAttribute('playsinline', '');
-        
-        // Clear existing sources and add new one
-        this.video.innerHTML = '';
-        const source = document.createElement('source');
-        source.type = 'video/mp4';
-        source.src = this.getVideoStreamUrl();
-        this.video.appendChild(source);
-        
-        // Create interactive overlay if it doesn't exist
-        let overlay = document.querySelector('.interactive-overlay');
-        if (!overlay) {
-            overlay = this.createInteractiveOverlay();
-            container.appendChild(overlay);
+  }
+
+  function clearChoices() {
+    while (choicesEl.firstChild) { choicesEl.removeChild(choicesEl.firstChild); }
+    choicesEl.className = '';
+    captionEl.className = '';
+    keypadEl.className = '';
+    barEl.style.width = '0%';
+  }
+
+  function renderChoices(moment) {
+    clearChoices();
+    selectedChoice = moment.defaultChoiceIndex || 0;
+
+    if (moment.type === 'scene:cs_bs_phone') {
+      slots = [];
+      renderSlots();
+      keypadEl.className = 'on';
+    } else {
+      (moment.choices || []).forEach(function (c, i) {
+        var b = document.createElement('button');
+        b.className = 'choice';
+        if (c.image && c.image.styles && c.image.styles.backgroundImage) {
+          b.style.backgroundImage = c.image.styles.backgroundImage;
+          b.style.backgroundSize = 'contain';
+          b.style.backgroundRepeat = 'no-repeat';
+          b.style.backgroundPosition = 'center';
+          b.style.minHeight = '4rem';
+          b.style.minWidth = '11rem';
         } else {
-            // Use existing overlay elements
-            this.choicesContainer = document.getElementById('choices');
-            this.timerElement = document.getElementById('timer');
-            this.countdownElement = document.getElementById('countdown');
-            this.progressBar = document.getElementById('progress');
+          b.textContent = c.text;
         }
-        
-        // Ensure video is in container
-        if (!this.video.parentElement) {
-            container.appendChild(this.video);
-        }
-        
-        if (this.loadingElement) {
-            this.loadingElement.style.display = 'none';
-        }
-        
-        console.log('Video element setup completed:', {
-            element: this.video,
-            src: this.video.querySelector('source')?.src,
-            styles: this.video.style.cssText
-        });
-    }
-    
-    createVideoContainer() {
-        const container = document.createElement('div');
-        container.id = 'video-container';
-        container.style.cssText = `
-            position: relative;
-            width: 100vw;
-            height: 100vh;
-            background: black;
-        `;
-        document.body.appendChild(container);
-        return container;
-    }
-    
-    createInteractiveOverlay() {
-        const overlay = document.createElement('div');
-        overlay.className = 'interactive-overlay';
-        overlay.style.cssText = `
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            pointer-events: none;
-            z-index: 1000;
-        `;
-        
-        // Choices container
-        this.choicesContainer = document.createElement('div');
-        this.choicesContainer.className = 'choice-container';
-        this.choicesContainer.style.cssText = `
-            position: absolute;
-            bottom: 100px;
-            left: 0;
-            right: 0;
-            display: none;
-            pointer-events: auto;
-            justify-content: center;
-            align-items: center;
-            gap: 20px;
-        `;
-        
-        // Timer
-        this.timerElement = document.createElement('div');
-        this.timerElement.className = 'choice-timer';
-        this.timerElement.style.cssText = `
-            position: absolute;
-            bottom: 50px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: rgba(0, 0, 0, 0.7);
-            color: white;
-            padding: 10px 20px;
-            border-radius: 5px;
-            font-size: 16px;
-            display: none;
-        `;
-        
-        this.countdownElement = document.createElement('span');
-        this.timerElement.innerHTML = 'Choose in ';
-        this.timerElement.appendChild(this.countdownElement);
-        this.timerElement.innerHTML += ' seconds';
-        
-        // Progress bar
-        this.progressBar = document.createElement('div');
-        this.progressBar.className = 'progress-bar';
-        this.progressBar.style.cssText = `
-            position: absolute;
-            bottom: 0;
-            left: 0;
-            height: 4px;
-            background: #e50914;
-            width: 0%;
-            transition: width 0.1s ease;
-        `;
-        
-        overlay.appendChild(this.choicesContainer);
-        overlay.appendChild(this.timerElement);
-        overlay.appendChild(this.progressBar);
-        
-        return overlay;
-    }
-    
-    getVideoStreamUrl() {
-        const baseUrl = window.location.origin;
-        return `${baseUrl}/Videos/${this.itemId}/stream?static=true&mediaSourceId=${this.itemId}`;
-    }
-    
-    setupVideo() {
-        // Configure video element
-        this.video.autoplay = false;
-        this.video.muted = false;
-        this.video.playsInline = true;
-        
-        // Add subtitle support
-        this.setupSubtitles();
-        
-        // Start loading the video
-        this.video.load();
-        
-        console.log('Video setup completed');
-    }
-    
-    setupSubtitles() {
-        // Load local subtitle file from plugin
-        console.log('Setting up local subtitle tracks...');
-        
-        // Add English subtitle track
-        this.addSubtitleTrack('English', 'en', '/InteractiveVideo/Subtitles/en');
-        
-        console.log('Subtitle setup completed');
-    }
-    
-    addSubtitleTrack(label, srclang, src) {
-        const track = document.createElement('track');
-        track.kind = 'subtitles';
-        track.label = label;
-        track.srclang = srclang;
-        track.src = src;
-        
-        // Handle loading
-        track.addEventListener('load', () => {
-            console.log(`Subtitle track "${label}" loaded successfully`);
-        });
-        
-        track.addEventListener('error', (e) => {
-            console.log(`Subtitle track "${label}" failed to load:`, e);
-        });
-        
-        this.video.appendChild(track);
-        console.log(`Added subtitle track: ${label} (${src})`);
-    }
-    
-    addJellyfinSubtitles() {
-        // Not needed anymore - using local subtitles
-        console.log('Using local subtitle files instead of Jellyfin endpoints');
-    }
-    
-    setupEventListeners() {
-        // Video events
-        this.video.addEventListener('timeupdate', () => this.onTimeUpdate());
-        this.video.addEventListener('loadedmetadata', () => this.onVideoLoaded());
-        this.video.addEventListener('error', () => this.showError('Video failed to load'));
-        this.video.addEventListener('ended', () => this.onVideoEnded());
-        
-        // Keyboard controls - use both keydown and keypress for different keys
-        document.addEventListener('keydown', (e) => this.onKeyDown(e));
-        document.addEventListener('keypress', (e) => this.onKeyPress(e));
-        
-        // Video click to play/pause
-        this.video.addEventListener('click', (e) => {
-            if (!this.isChoiceActive) {
-                this.video.paused ? this.video.play() : this.video.pause();
-            }
-            e.preventDefault();
-        });
-        
-        // Prevent context menu on video
-        this.video.addEventListener('contextmenu', (e) => e.preventDefault());
-        
-        // Double click for fullscreen
-        this.video.addEventListener('dblclick', () => this.toggleFullscreen());
-        
-        console.log('Event listeners setup completed');
-    }
-    
-    initializeState() {
-        // Initialize persistent state if not exists
-        if (!this.ls.interactive_initialized) {
-            this.ls.interactive_initialized = 'true';
-            this.ls.interactive_state = JSON.stringify({});
-            this.ls.interactive_choices = JSON.stringify([]);
-            this.ls.interactive_segments_seen = JSON.stringify([]);
-        }
-        
-        // Load current state
-        try {
-            this.state = JSON.parse(this.ls.interactive_state || '{}');
-        } catch (e) {
-            this.state = {};
-        }
-        
-        console.log('State initialized:', this.state);
-    }
-    
-    onVideoLoaded() {
-        console.log('Video loaded, duration:', this.video.duration);
-        this.video.play().catch(e => {
-            console.warn('Autoplay failed:', e);
-            this.showPlayButton();
-        });
-    }
-    
-    showPlayButton() {
-        // Create a clickable play button overlay
-        const playOverlay = document.createElement('div');
-        playOverlay.id = 'play-overlay';
-        playOverlay.style.cssText = `
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.7);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-            z-index: 2000;
-        `;
-        
-        const playButton = document.createElement('div');
-        playButton.style.cssText = `
-            background: #e50914;
-            color: white;
-            padding: 20px 40px;
-            border-radius: 10px;
-            font-size: 24px;
-            font-weight: bold;
-            text-align: center;
-            box-shadow: 0 4px 20px rgba(229, 9, 20, 0.5);
-            transition: all 0.3s ease;
-        `;
-        playButton.textContent = '▶ Click to Start Playback';
-        
-        playButton.addEventListener('mouseenter', () => {
-            playButton.style.transform = 'scale(1.05)';
-            playButton.style.boxShadow = '0 6px 25px rgba(229, 9, 20, 0.7)';
-        });
-        
-        playButton.addEventListener('mouseleave', () => {
-            playButton.style.transform = 'scale(1)';
-            playButton.style.boxShadow = '0 4px 20px rgba(229, 9, 20, 0.5)';
-        });
-        
-        playOverlay.appendChild(playButton);
-        
-        // Add click handler to start playback
-        playOverlay.addEventListener('click', () => {
-            this.video.play().then(() => {
-                // Ensure overlay is completely removed
-                if (playOverlay.parentNode) {
-                    playOverlay.parentNode.removeChild(playOverlay);
-                }
-                console.log('Playback started successfully, overlay removed');
-                
-                // Ensure video is visible
-                this.video.style.display = 'block';
-                this.video.style.visibility = 'visible';
-                this.video.style.opacity = '1';
-                
-                console.log('Video should now be visible:', {
-                    display: this.video.style.display,
-                    visibility: this.video.style.visibility,
-                    opacity: this.video.style.opacity,
-                    zIndex: this.video.style.zIndex
-                });
-                
-            }).catch(e => {
-                console.error('Failed to start playback:', e);
-                this.showError('Failed to start video playback. Please try again.');
-            });
-        });
-        
-        // Add to video container
-        const container = this.video.parentElement;
-        container.appendChild(playOverlay);
-        
-        console.log('Play button overlay shown - click to start');
-    }
-    
-    onTimeUpdate() {
-        const currentTimeMs = this.video.currentTime * 1000;
-        
-        // Update progress bar
-        if (this.video.duration) {
-            const progress = (this.video.currentTime / this.video.duration) * 100;
-            this.progressBar.style.width = progress + '%';
-        }
-        
-        // Check for interactive moments
-        if (!this.isChoiceActive) {
-            this.checkForChoices(currentTimeMs);
-        }
-        
-        // Update current segment
-        this.updateCurrentSegment(currentTimeMs);
-    }
-    
-    updateCurrentSegment(currentTimeMs) {
-        const segmentId = this.getSegmentIdAtTime(currentTimeMs);
-        if (segmentId && segmentId !== this.currentSegment) {
-            this.currentSegment = segmentId;
-            console.log('Entered segment:', segmentId);
-            this.recordSegmentVisit(segmentId);
-        }
-    }
-    
-    recordSegmentVisit(segmentId) {
-        try {
-            const segmentsSeen = JSON.parse(this.ls.interactive_segments_seen || '[]');
-            if (!segmentsSeen.includes(segmentId)) {
-                segmentsSeen.push(segmentId);
-                this.ls.interactive_segments_seen = JSON.stringify(segmentsSeen);
-            }
-        } catch (e) {
-            console.warn('Failed to record segment visit:', e);
-        }
-    }
-    
-    checkForChoices(currentTimeMs) {
-        if (!this.currentSegment || !this.momentsBySegment[this.currentSegment]) {
-            return;
-        }
-
-        const moments = this.momentsBySegment[this.currentSegment];
-        const segmentStartTime = this.segmentMap[this.currentSegment].startTimeMs;
-        const relativeTime = currentTimeMs - segmentStartTime;
-
-        for (const moment of moments) {
-            // Let video continue playing 7 seconds past the original choice point
-            const extendedEndMs = moment.endMs + 7000;
-            
-            if (relativeTime >= moment.startMs && relativeTime <= extendedEndMs) {
-                // Check if we've already shown this choice recently
-                const choiceKey = `${this.currentSegment}_${moment.startMs}`;
-                if (this.lastChoiceShown === choiceKey) {
-                    return; // Don't show the same choice again
-                }
-                
-                // Show choice only after the extended period (7s after original end)
-                if (relativeTime >= (moment.endMs + 5000)) { // Show 5s before extended end
-                    console.log('Choice timing:', {
-                        segmentTime: relativeTime,
-                        originalStart: moment.startMs,
-                        originalEnd: moment.endMs,
-                        extendedEnd: extendedEndMs,
-                        showingAt: moment.endMs + 5000,
-                        message: 'Video continued 7s longer, showing choice now'
-                    });
-                    
-                    this.lastChoiceShown = choiceKey;
-                    this.showChoices(moment);
-                    break;
-                }
-            }
-        }
-    }
-    
-    showChoices(moment) {
-        if (this.isChoiceActive) return;
-        
-        this.isChoiceActive = true;
-        this.video.pause();
-        
-        console.log('Showing choices:', moment);
-        
-        // Clear previous choices
-        this.choicesContainer.innerHTML = '';
-        
-        // Create choice buttons
-        moment.choices.forEach((choice, index) => {
-            const button = document.createElement('button');
-            button.className = 'choice-button';
-            button.textContent = choice.text;
-            button.style.cssText = `
-                background: rgba(255, 255, 255, 0.9);
-                color: #000;
-                border: none;
-                padding: 15px 30px;
-                font-size: 18px;
-                font-weight: bold;
-                cursor: pointer;
-                border-radius: 5px;
-                transition: all 0.3s ease;
-                min-width: 200px;
-                margin: 0 10px;
-            `;
-            
-            button.addEventListener('click', () => this.makeChoice(index, moment));
-            button.addEventListener('mouseenter', () => {
-                this.selectedChoice = index;
-                this.updateChoiceSelection();
-            });
-            
-            this.choicesContainer.appendChild(button);
-        });
-        
-        this.choicesContainer.style.display = 'flex';
-        this.selectedChoice = 0;
-        this.updateChoiceSelection();
-        
-        // Start timer
-        this.startChoiceTimer(moment);
-    }
-    
-    startChoiceTimer(moment) {
-        let timeLeft = 10; // Default timeout
-        this.timerElement.style.display = 'block';
-        this.countdownElement.textContent = timeLeft;
-        
-        this.choiceTimeout = setInterval(() => {
-            timeLeft--;
-            this.countdownElement.textContent = timeLeft;
-            
-            if (timeLeft <= 0) {
-                this.makeChoice(0, moment); // Default to first choice
-            }
-        }, 1000);
-    }
-    
-    updateChoiceSelection() {
-        const buttons = this.choicesContainer.querySelectorAll('.choice-button');
-        buttons.forEach((button, index) => {
-            if (index === this.selectedChoice) {
-                button.style.background = '#e50914';
-                button.style.color = 'white';
-                button.style.transform = 'scale(1.05)';
-            } else {
-                button.style.background = 'rgba(255, 255, 255, 0.9)';
-                button.style.color = '#000';
-                button.style.transform = 'scale(1)';
-            }
-        });
-    }
-    
-    makeChoice(choiceIndex, moment) {
-        if (!this.isChoiceActive) return;
-        
-        console.log('Choice made:', choiceIndex, moment.choices[choiceIndex]);
-        
-        // Clear timer
-        if (this.choiceTimeout) {
-            clearInterval(this.choiceTimeout);
-            this.choiceTimeout = null;
-        }
-        
-        // Record choice
-        this.recordChoice(choiceIndex, moment);
-        
-        // Hide choice UI
-        this.hideChoices();
-        
-        // Clear the last choice shown to prevent repetition
-        this.lastChoiceShown = null;
-        
-        // Continue playback or jump to next segment
-        this.handleChoiceAction(choiceIndex, moment);
-    }
-    
-    recordChoice(choiceIndex, moment) {
-        try {
-            const choices = JSON.parse(this.ls.interactive_choices || '[]');
-            choices.push({
-                timestamp: this.video.currentTime,
-                choice: choiceIndex,
-                choiceId: moment.choices[choiceIndex].id,
-                moment: moment.description
-            });
-            this.ls.interactive_choices = JSON.stringify(choices);
-            
-            // Update state
-            this.state[moment.description] = moment.choices[choiceIndex].id;
-            this.ls.interactive_state = JSON.stringify(this.state);
-            
-            // Send to server for analytics
-            fetch(`/InteractiveVideo/Choice/${this.itemId}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    choice: choiceIndex,
-                    choiceId: moment.choices[choiceIndex].id,
-                    timestamp: this.video.currentTime,
-                    segment: this.currentSegment
-                })
-            }).catch(e => console.warn('Failed to send choice to server:', e));
-            
-        } catch (e) {
-            console.warn('Failed to record choice:', e);
-        }
-    }
-    
-    hideChoices() {
-        this.isChoiceActive = false;
-        this.choicesContainer.style.display = 'none';
-        this.timerElement.style.display = 'none';
-    }
-    
-    handleChoiceAction(choiceIndex, moment) {
-        const choiceId = moment.choices[choiceIndex].id;
-        console.log('Handling choice action:', choiceId);
-        
-        // Find the segment that corresponds to this choice
-        const targetSegment = this.findSegmentByChoiceId(choiceId);
-        
-        if (targetSegment) {
-            console.log('Jumping to segment:', targetSegment);
-            // Jump to the target segment
-            const targetTimeSeconds = this.segmentMap[targetSegment].startTimeMs / 1000;
-            this.video.currentTime = targetTimeSeconds;
-            this.currentSegment = targetSegment;
-            this.video.play();
-        } else {
-            console.warn('No target segment found for choice:', choiceId, 'continuing normal playback');
-            // Just continue playing if no specific segment found
-            this.video.play();
-        }
-    }
-    
-    findSegmentByChoiceId(choiceId) {
-        // Look for a segment that matches this choice ID
-        // First check if the choice ID is directly a segment ID
-        if (this.segmentMap[choiceId]) {
-            return choiceId;
-        }
-        
-        // For the simplified metadata, we need to map choice IDs to segments
-        // Based on the structure, let's create a simple mapping
-        const choiceToSegmentMap = {
-            '1R': '1E',  // Sugar Puffs -> segment 1E
-            '1S': '1E',  // Frosties -> segment 1E (same path for cereal choice)
-            '1H': '1H',  // Accept music -> segment 1H
-            '1G': '1H',  // Decline music -> segment 1H (simplified)
-            '8A': '8A',  // Accept -> segment 8A
-            '1Qtt': '1Qtt', // Decline -> segment 1Qtt
-            'nsg-LettersPACSChoice': '1Qtt', // PACS choice
-            'nsg-WhiteBearChoice': '1Qtt',   // White Bear choice
-            'nsg-ThrowThemChoice': '2B',     // Throw pills
-            'nsg-FlushThemChoice3X': '2B'    // Flush pills
-        };
-        
-        return choiceToSegmentMap[choiceId] || null;
-    }
-    
-    onKeyPress(event) {
-        // Handle keypress events (for character keys)
-        if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
-            return;
-        }
-
-        console.log('KeyPress event:', event.code, event.key);
-
-        switch (event.code) {
-            case 'KeyF':
-            case 'KeyR':
-            case 'KeyS':
-            case 'Space':
-                // These are handled in keydown to prevent conflicts
-                event.preventDefault();
-                break;
-        }
+        b.addEventListener('click', function (e) { e.preventDefault(); choose(i); });
+        b.addEventListener('mouseenter', function () { selectedChoice = i; paintSelection(); });
+        choicesEl.appendChild(b);
+      });
+      choicesEl.className = 'on';
     }
 
-    onKeyDown(event) {
-        // Handle keydown events (for all keys including arrows)
-        if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
-            return;
-        }
+    if (moment.id && choicePoints[moment.id] && choicePoints[moment.id].description) {
+      captionEl.textContent = choicePoints[moment.id].description;
+      captionEl.className = 'on';
+    }
+    paintSelection();
+  }
 
-        console.log('KeyDown event:', event.code, event.key);
+  var selectedChoice = 0;
+  function paintSelection() {
+    var buttons = choicesEl.querySelectorAll('.choice');
+    for (var i = 0; i < buttons.length; i++) {
+      buttons[i].className = 'choice' + (i === selectedChoice ? ' sel' : '');
+    }
+  }
 
-        // Global controls (available anytime)
-        switch (event.code) {
-            case 'KeyF':
-                this.toggleFullscreen();
-                event.preventDefault();
-                event.stopPropagation();
-                break;
-            case 'KeyR':
-                this.restartVideo();
-                event.preventDefault();
-                event.stopPropagation();
-                break;
-            case 'KeyS':
-                this.toggleSubtitles();
-                event.preventDefault();
-                event.stopPropagation();
-                break;
-            case 'Digit0':
-                if (!this.isChoiceActive) {
-                    // Reset speed to 1x
-                    this.currentSpeedIndex = 3; // 1.0x is at index 3
-                    this.video.playbackRate = this.speedSteps[this.currentSpeedIndex];
-                    console.log('Playback speed reset to:', this.video.playbackRate);
-                    this.showSpeedNotification(`${this.video.playbackRate}x (Reset)`);
-                }
-                event.preventDefault();
-                event.stopPropagation();
-                break;
-            case 'Space':
-                if (!this.isChoiceActive) {
-                    this.video.paused ? this.video.play() : this.video.pause();
-                }
-                event.preventDefault();
-                event.stopPropagation();
-                break;
-        }
+  /* ---------------------------------------------------------------- engine */
 
-        // Arrow key controls
-        switch (event.key) {
-            case 'ArrowLeft':
-                if (this.isChoiceActive) {
-                    this.selectedChoice = Math.max(0, this.selectedChoice - 1);
-                    this.updateChoiceSelection();
-                } else {
-                    this.jumpBack();
-                }
-                event.preventDefault();
-                event.stopPropagation();
-                break;
-            case 'ArrowRight':
-                if (this.isChoiceActive) {
-                    const maxChoice = this.choicesContainer.children.length - 1;
-                    this.selectedChoice = Math.min(maxChoice, this.selectedChoice + 1);
-                    this.updateChoiceSelection();
-                } else {
-                    this.jumpForward();
-                }
-                event.preventDefault();
-                event.stopPropagation();
-                break;
-            case 'ArrowUp':
-                if (!this.isChoiceActive) {
-                    // Speed up playback using defined steps
-                    this.currentSpeedIndex = Math.min(this.speedSteps.length - 1, this.currentSpeedIndex + 1);
-                    this.video.playbackRate = this.speedSteps[this.currentSpeedIndex];
-                    console.log('Playback speed increased to:', this.video.playbackRate);
-                    this.showSpeedNotification(`${this.video.playbackRate}x`);
-                }
-                event.preventDefault();
-                event.stopPropagation();
-                break;
-            case 'ArrowDown':
-                if (!this.isChoiceActive) {
-                    // Slow down playback using defined steps
-                    this.currentSpeedIndex = Math.max(0, this.currentSpeedIndex - 1);
-                    this.video.playbackRate = this.speedSteps[this.currentSpeedIndex];
-                    console.log('Playback speed decreased to:', this.video.playbackRate);
-                    this.showSpeedNotification(`${this.video.playbackRate}x`);
-                }
-                event.preventDefault();
-                event.stopPropagation();
-                break;
-            case 'Enter':
-                if (this.isChoiceActive) {
-                    const currentMoment = this.getCurrentMoment();
-                    if (currentMoment) {
-                        this.makeChoice(this.selectedChoice, currentMoment);
-                    }
-                }
-                event.preventDefault();
-                event.stopPropagation();
-                break;
-        }
-    }
-    
-    jumpForward() {
-        const currentTimeMs = this.video.currentTime * 1000;
-        const segmentId = this.getSegmentIdAtTime(currentTimeMs);
-        
-        if (!segmentId || !this.momentsBySegment[segmentId]) {
-            // Jump to next segment if no moments in current segment
-            this.jumpToNextSegment();
-            return;
-        }
+  var timerId = 0;
+  var lastMs = 0;
+  var currentSegment = null;
+  var lastSegment = null;
+  var prevSegment = null;
+  var segmentTransition = false;
+  var lastMoments = {};
+  var currentMoment = null;
+  var pendingTarget = null;   // branch chosen for the segment we are in
+  var pendingFrom = null;
+  var lastPlace = '';
 
-        const moments = this.momentsBySegment[segmentId];
-        const segmentStartTime = this.segmentMap[segmentId].startTimeMs;
-        const relativeTime = currentTimeMs - segmentStartTime;
-        
-        // Find the earliest moment after current time
-        let nextMomentTime = null;
-        for (const moment of moments) {
-            if (moment.startMs > relativeTime) {
-                if (!nextMomentTime || moment.startMs < nextMomentTime) {
-                    nextMomentTime = moment.startMs;
-                }
-            }
-        }
-        
-        if (nextMomentTime !== null) {
-            const targetTime = (segmentStartTime + nextMomentTime) / 1000;
-            this.video.currentTime = targetTime;
-            console.log('Jumped forward to next moment at', targetTime, 'seconds');
-        } else {
-            this.jumpToNextSegment();
-        }
-    }
-    
-    jumpBack() {
-        const currentTimeMs = this.video.currentTime * 1000;
-        const segmentId = this.getSegmentIdAtTime(currentTimeMs);
-        
-        if (!segmentId || !this.momentsBySegment[segmentId]) {
-            // Jump to beginning of current segment
-            const segment = this.segmentMap[segmentId];
-            if (segment) {
-                this.video.currentTime = segment.startTimeMs / 1000;
-            }
-            return;
-        }
+  function getCurrentMs() { return Math.round(video.currentTime * 1000); }
 
-        const moments = this.momentsBySegment[segmentId];
-        const segmentStartTime = this.segmentMap[segmentId].startTimeMs;
-        const relativeTime = currentTimeMs - segmentStartTime;
-        
-        // Find the latest moment before current time
-        let prevMomentTime = null;
-        for (const moment of moments) {
-            if (moment.startMs < relativeTime - 1000) { // 1 second buffer
-                if (!prevMomentTime || moment.startMs > prevMomentTime) {
-                    prevMomentTime = moment.startMs;
-                }
-            }
-        }
-        
-        if (prevMomentTime !== null) {
-            const targetTime = (segmentStartTime + prevMomentTime) / 1000;
-            this.video.currentTime = targetTime;
-            console.log('Jumped back to previous moment at', targetTime, 'seconds');
-        } else {
-            // Jump to beginning of current segment
-            this.video.currentTime = segmentStartTime / 1000;
-            console.log('Jumped to beginning of segment', segmentId);
-        }
-    }
-    
-    jumpToNextSegment() {
-        // Simplified next segment logic
-        const nextSegments = Object.keys(this.segmentMap);
-        const currentIndex = nextSegments.indexOf(this.currentSegment);
-        if (currentIndex >= 0 && currentIndex < nextSegments.length - 1) {
-            const nextSegment = nextSegments[currentIndex + 1];
-            const targetTime = this.segmentMap[nextSegment].startTimeMs / 1000;
-            this.video.currentTime = targetTime;
-            console.log('Jumped to next segment:', nextSegment);
-        }
-    }
-    
-    getCurrentMoment() {
-        if (!this.currentSegment || !this.momentsBySegment[this.currentSegment]) {
-            return null;
-        }
-        
-        const moments = this.momentsBySegment[this.currentSegment];
-        const segmentStartTime = this.segmentMap[this.currentSegment].startTimeMs;
-        const relativeTime = (this.video.currentTime * 1000) - segmentStartTime;
-        
-        return moments.find(moment => 
-            relativeTime >= moment.startMs && relativeTime <= moment.endMs
-        );
-    }
-    
-    toggleFullscreen() {
-        if (!document.fullscreenElement) {
-            document.documentElement.requestFullscreen().catch(e => 
-                console.warn('Fullscreen failed:', e)
-            );
-        } else {
-            document.exitFullscreen();
-        }
-    }
-    
-    restartVideo() {
-        this.video.currentTime = 0;
-        this.hideChoices();
-        this.video.play();
-    }
-    
-    onVideoEnded() {
-        console.log('Video ended');
-        // Could show ending statistics or restart options
-    }
-    
-    showError(message) {
-        console.error('Error:', message);
-        
-        if (!this.errorElement) {
-            this.errorElement = document.createElement('div');
-            this.errorElement.style.cssText = `
-                position: fixed;
-                top: 50%;
-                left: 50%;
-                transform: translate(-50%, -50%);
-                background: rgba(0, 0, 0, 0.8);
-                color: #e50914;
-                padding: 20px;
-                border-radius: 5px;
-                font-size: 18px;
-                text-align: center;
-                z-index: 2000;
-            `;
-            document.body.appendChild(this.errorElement);
-        }
-        
-        this.errorElement.textContent = message;
-        this.errorElement.style.display = 'block';
-        
-        if (this.loadingElement) {
-            this.loadingElement.style.display = 'none';
-        }
-    }
-    
-    // Utility methods for debugging
-    getState() {
-        return {
-            currentTime: this.video?.currentTime,
-            currentSegment: this.currentSegment,
-            state: this.state,
-            choices: JSON.parse(this.ls.interactive_choices || '[]'),
-            segmentsSeen: JSON.parse(this.ls.interactive_segments_seen || '[]')
-        };
-    }
-    
-    reset() {
-        if (confirm('Reset all choices and progress?')) {
-            this.ls.interactive_state = JSON.stringify({});
-            this.ls.interactive_choices = JSON.stringify([]);
-            this.ls.interactive_segments_seen = JSON.stringify([]);
-            this.state = {};
-            this.restartVideo();
-            console.log('Interactive state reset');
-        }
-    }
-    
-    toggleSubtitles() {
-        console.log('Toggle subtitles called, tracks available:', this.video.textTracks.length);
-        
-        // Wait a moment if tracks are still loading
-        if (this.video.textTracks.length === 0) {
-            console.log('No subtitle tracks available yet, checking in 1 second...');
-            setTimeout(() => {
-                if (this.video.textTracks.length === 0) {
-                    console.log('Still no subtitle tracks available');
-                    this.showSubtitleNotification('No Subtitles Available');
-                } else {
-                    this.toggleSubtitles(); // Try again
-                }
-            }, 1000);
-            return;
-        }
+  function seek(ms) {
+    log('seek', ms);
+    video.currentTime = ms / 1000;
+    onTimeUpdate(true);
+  }
 
-        // Find currently active track
-        let activeTrackIndex = -1;
-        for (let i = 0; i < this.video.textTracks.length; i++) {
-            if (this.video.textTracks[i].mode === 'showing') {
-                activeTrackIndex = i;
-                this.video.textTracks[i].mode = 'disabled';
-                break;
-            }
-        }
+  function playSegment(segmentId, noSeek) {
+    if (!segmentId) { segmentId = segmentMap.initialSegment; }
+    var oldSegment = getSegmentId(getCurrentMs());
+    log('playSegment', oldSegment, '->', segmentId);
+    if (!noSeek || oldSegment !== segmentId) {
+      seek(getSegmentMs(segmentId));
+      return true;
+    }
+    return false;
+  }
 
-        const nextIndex = (activeTrackIndex + 1) % (this.video.textTracks.length + 1);
-        
-        if (nextIndex < this.video.textTracks.length) {
-            this.video.textTracks[nextIndex].mode = 'showing';
-            console.log('Enabled subtitle track:', this.video.textTracks[nextIndex].label);
-            this.showSubtitleNotification(`Subtitles: ${this.video.textTracks[nextIndex].label}`);
-        } else {
-            console.log('Subtitles disabled');
-            this.showSubtitleNotification('Subtitles: Off');
+  function playNextSegment(fromSegment) {
+    var next = null;
+    if (pendingTarget && pendingFrom === fromSegment) {
+      next = pendingTarget;
+      pendingTarget = null;
+      pendingFrom = null;
+    }
+    if (!next && fromSegment && segmentGroups[fromSegment]) {
+      next = resolveSegmentGroup(fromSegment);
+    }
+    if (!next && fromSegment && segmentMap.segments[fromSegment] &&
+        segmentMap.segments[fromSegment].defaultNext) {
+      next = segmentMap.segments[fromSegment].defaultNext;
+    }
+    if (!next) { return false; }
+
+    var breadcrumb = 'breadcrumb_' + next;
+    if (get(breadcrumb) === undefined) { set(breadcrumb, fromSegment); }
+    segmentTransition = true;
+    return playSegment(next, true);
+  }
+
+  function choose(index) {
+    var moment = currentMoment;
+    clearChoices();
+    if (!moment) { return; }
+
+    var x = (moment.choices || [])[index];
+    var target = null;
+    if (x) {
+      if (x.segmentId) { target = x.segmentId; }
+      else if (x.sg) { target = resolveSegmentGroup(x.sg); }
+      applyImpression(x.impressionData);
+    }
+    pendingTarget = target;
+    pendingFrom = currentSegment;
+
+    set('choices', (get('choices', [])).concat([{
+      at: getCurrentMs(), id: moment.id, index: index, segment: currentSegment, target: target
+    }]));
+    log('choice', index, 'from', currentSegment, '->', target,
+        (moment.config && moment.config.disableImmediateSceneTransition) ? '(deferred)' : '(now)');
+
+    // Netflix defers most branches until the end of the segment; only a few
+    // cut away the moment you pick.
+    if (!(moment.config && moment.config.disableImmediateSceneTransition)) {
+      playNextSegment(currentSegment);
+    }
+  }
+
+  function jumpForward() {
+    var ms = getCurrentMs();
+    var segmentId = getSegmentId(ms);
+    var list = moments[segmentId] || [];
+    var interactionMs = 0;
+    for (var i = 0; i < list.length; i++) {
+      var m = list[i];
+      if (m.startMs > ms && (interactionMs === 0 || m.startMs < interactionMs)) { interactionMs = m.startMs; }
+    }
+    segmentTransition = true;
+    if (interactionMs) { seek(interactionMs); } else { playNextSegment(segmentId); }
+  }
+
+  function jumpBack() {
+    var ms = getCurrentMs();
+    var segmentId = getSegmentId(ms);
+    var segment = segmentMap.segments[segmentId];
+    var list = moments[segmentId] || [];
+    var interactionMs = 0;
+    var inMoment = false;
+    for (var i = 0; i < list.length; i++) {
+      var m = list[i];
+      if (m.endMs < ms && m.startMs > interactionMs) { interactionMs = m.startMs; }
+      if (m.startMs !== segment.startTimeMs && m.startMs <= ms && ms < m.endMs) { inMoment = true; }
+    }
+    segmentTransition = true;
+    if (interactionMs) {
+      seek(interactionMs);
+    } else if (inMoment) {
+      seek(segment.startTimeMs);
+    } else {
+      var previous = get('breadcrumb_' + segmentId);
+      if (previous !== undefined && segmentMap.segments[previous]) {
+        var prev = segmentMap.segments[previous];
+        var prevList = moments[previous] || [];
+        var target = prev.startTimeMs;
+        for (var j = 0; j < prevList.length; j++) {
+          if (prevList[j].startMs > target) { target = prevList[j].startMs; }
         }
+        seek(target);
+      } else {
+        seek(0);
+      }
+    }
+  }
+
+  function momentStart(m, seeked) {
+    if (m.choices) {
+      currentMoment = m;
+      renderChoices(m);
+    }
+    if (!seeked) { applyImpression(m.impressionData); }
+  }
+  function momentUpdate(m, ms) {
+    if (!m.choices) { return; }
+    var total = m.endMs - m.startMs;
+    var left = Math.max(0, m.endMs - ms);
+    barEl.style.width = (total > 0 ? (left * 100 / total) : 0) + '%';
+  }
+  function momentEnd(m, seeked) {
+    if (m.choices) {
+      clearChoices();
+      currentMoment = null;
+    }
+  }
+
+  function onTimeUpdate(forced) {
+    var ms = getCurrentMs();
+    var segmentId = getSegmentId(ms);
+    var segment = segmentId ? segmentMap.segments[segmentId] : null;
+
+    if (timerId) { clearTimeout(timerId); timerId = 0; }
+
+    var elapsed = ms - lastMs;
+    var seeked = forced === true || elapsed < 0 || elapsed >= 2000;
+    lastMs = ms;
+
+    var placeChanged = false;
+
+    if (lastSegment !== segmentId) {
+      log('segment', lastSegment, '->', segmentId, ms);
+      prevSegment = lastSegment;
+      lastSegment = segmentId;
+      currentSegment = segmentId;
+      if (!seeked && prevSegment) {
+        if (playNextSegment(prevSegment)) { return; } // it seeked; a fresh update is on its way
+      }
+      placeChanged = true;
     }
 
-    showSubtitleNotification(message) {
-        // Create temporary notification
-        const notification = document.createElement('div');
-        notification.style.cssText = `
-            position: absolute;
-            top: 50px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: rgba(0, 0, 0, 0.8);
-            color: white;
-            padding: 10px 20px;
-            border-radius: 5px;
-            font-size: 16px;
-            z-index: 3000;
-            pointer-events: none;
-        `;
-        notification.textContent = message;
-        
-        // Add to video container
-        const container = this.video.parentElement;
-        container.appendChild(notification);
-        
-        // Remove after 2 seconds
-        setTimeout(() => {
-            if (notification.parentElement) {
-                notification.parentElement.removeChild(notification);
-            }
-        }, 2000);
+    var naturalTransition = !seeked || segmentTransition;
+    segmentTransition = false;
+
+    var currentMoments = getMoments(segmentId, ms);
+    var k;
+    for (k in lastMoments) {
+      if (!(k in currentMoments)) { momentEnd(lastMoments[k], !naturalTransition); placeChanged = true; }
+    }
+    for (k in lastMoments) {
+      if (k in currentMoments) { momentUpdate(lastMoments[k], ms); }
+    }
+    for (k in currentMoments) {
+      if (!(k in lastMoments)) { momentStart(currentMoments[k], !naturalTransition); placeChanged = true; }
+    }
+    lastMoments = currentMoments;
+
+    if (placeChanged) {
+      var place = segmentId;
+      for (k in currentMoments) {
+        var m = currentMoments[k];
+        if (m.startMs > (segment ? segment.startTimeMs : 0)) { place = k; }
+      }
+      if (place !== lastPlace) {
+        lastPlace = place;
+        set('place', place);
+        try { history.replaceState(null, '', '#' + place); } catch (e) { /* ignore */ }
+      }
+      updateHud();
     }
 
-    showSpeedNotification(speed) {
-        this.showSubtitleNotification(`Speed: ${speed}`);
+    // timeupdate fires only ~4x/s: wake up exactly on the next boundary.
+    var nextEvent = segment ? segment.endTimeMs : 0;
+    for (k in currentMoments) {
+      if (currentMoments[k].endMs < nextEvent) { nextEvent = currentMoments[k].endMs; }
     }
-}
+    var list = moments[segmentId] || [];
+    for (var i = 0; i < list.length; i++) {
+      if (ms < list[i].startMs && list[i].startMs < nextEvent) { nextEvent = list[i].startMs; }
+    }
+    var timeLeft = nextEvent - ms;
+    if (timeLeft > 0 && !video.paused) {
+      timerId = setTimeout(function () { onTimeUpdate(); }, timeLeft);
+    }
+  }
 
-// Global functions for debugging
-window.InteractivePlayer = JellyfinInteractivePlayer;
-window.getPlayerState = function() {
-    return window.player?.getState();
-};
-window.resetPlayer = function() {
-    return window.player?.reset();
-}; 
+  function updateHud() {
+    hudSegEl.textContent = currentSegment ? ('CHAPTER ' + currentSegment) : '';
+    if (!barShown && currentSegment) { hudEl.className = 'on'; }
+  }
+  var barShown = false;
+
+  /* ---------------------------------------------------------------- controls */
+
+  var speedSteps = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
+  var speedIndex = 3;
+
+  function setSpeed(index) {
+    speedIndex = Math.max(0, Math.min(speedSteps.length - 1, index));
+    video.playbackRate = speedSteps[speedIndex];
+    hudSpeedEl.textContent = video.playbackRate + 'x';
+    toast(video.playbackRate + 'x');
+  }
+
+  function toggleFullscreen() {
+    var el = document.getElementById('stage');
+    if (document.fullscreenElement) { document.exitFullscreen(); }
+    else if (el.requestFullscreen) { el.requestFullscreen(); }
+  }
+
+  function toggleSubtitles() {
+    var tracks = video.textTracks;
+    if (!tracks || !tracks.length) { return; }
+    var t = tracks[0];
+    t.mode = t.mode === 'showing' ? 'hidden' : 'showing';
+    toast('subtitles ' + (t.mode === 'showing' ? 'on' : 'off'));
+  }
+
+  function restart() { pendingTarget = null; pendingFrom = null; playSegment(segmentMap.initialSegment); video.play(); }
+
+  document.addEventListener('keydown', function (e) {
+    if (e.altKey || e.ctrlKey || e.metaKey) { return; }
+    var choiceMode = choicesEl.className === 'on';
+    var count = choicesEl.querySelectorAll('.choice').length;
+    switch (e.code) {
+      case 'KeyF': toggleFullscreen(); break;
+      case 'KeyR': restart(); break;
+      case 'KeyS': toggleSubtitles(); break;
+      case 'KeyD': DEBUG = !DEBUG; toast('debug ' + (DEBUG ? 'on' : 'off')); break;
+      case 'Digit0': setSpeed(3); break;
+      case 'Space': if (!choiceMode) { if (video.paused) { video.play(); } else { video.pause(); } } break;
+      case 'ArrowLeft':
+        if (choiceMode && count) { selectedChoice = (selectedChoice - 1 + count) % count; paintSelection(); }
+        else { jumpBack(); }
+        break;
+      case 'ArrowRight':
+        if (choiceMode && count) { selectedChoice = (selectedChoice + 1) % count; paintSelection(); }
+        else { jumpForward(); }
+        break;
+      case 'ArrowUp': setSpeed(speedIndex + 1); break;
+      case 'ArrowDown': setSpeed(speedIndex - 1); break;
+      case 'Enter':
+        if (choiceMode) {
+          if (keypadEl.className === 'on') { break; }
+          choose(selectedChoice);
+        }
+        break;
+      default:
+        if (keypadEl.className === 'on' && /^Digit[0-9]$/.test(e.code)) { pressDigit(e.code.slice(5)); }
+        break;
+    }
+    e.preventDefault();
+  });
+
+  document.querySelectorAll('.keys button').forEach(function (b) {
+    b.addEventListener('click', function (e) { e.preventDefault(); pressDigit(b.dataset.d); });
+  });
+
+  video.addEventListener('click', function () {
+    if (choicesEl.className !== 'on') { if (video.paused) { video.play(); } else { video.pause(); } }
+  });
+  video.addEventListener('dblclick', toggleFullscreen);
+  video.addEventListener('timeupdate', function () { onTimeUpdate(); });
+  video.addEventListener('playing', function () { hudEl.className = 'on'; barShown = true; });
+
+  /* ------------------------------------------------------------------- boot */
+
+  function BandersnatchPlayer(itemId) {
+    this.itemId = itemId;
+    this.ready = false;
+    var self = this;
+
+    video.addEventListener('loadedmetadata', function () {
+      self.ready = true;
+      log('video loaded', video.videoWidth + 'x' + video.videoHeight, video.duration + 's');
+      if (video.videoWidth === 0) {
+        showMessage('This browser cannot decode the video track (HEVC?). ' +
+                    'Add an H.264 rendition of the file to the library.');
+        return;
+      }
+      var hash = location.hash ? location.hash.slice(1) : '';
+      var place = hash || (RESUME ? get('place', '') : '');
+      if (place) { playPlace(place); } else { playSegment(segmentMap.initialSegment); }
+      video.play().catch(function () { /* the start overlay stays up */ });
+    });
+
+    video.addEventListener('error', function () {
+      var err = video.error;
+      showMessage('Playback error' + (err ? ' (' + err.code + '): ' + err.message : ''));
+    });
+
+    var track = document.createElement('track');
+    track.kind = 'subtitles';
+    track.label = 'English';
+    track.srclang = 'en';
+    track.src = SUBTITLE_URL;
+    video.appendChild(track);
+
+    startEl.addEventListener('click', function () {
+      startEl.className = 'hide';
+      barShown = true;
+      video.play();
+      if (!lastSegment) { playSegment(segmentMap.initialSegment); }
+    });
+
+    resolveStreamUrl(itemId).then(function (info) {
+      log('stream', info.url, info.container);
+      video.src = info.url;
+      video.load();
+    }).catch(function (e) {
+      showMessage('Could not resolve a stream for this item: ' + e.message);
+    });
+  }
+
+  function playPlace(place) {
+    // place is either "<segmentId>", "<segmentId>/<momentIndex>" or "t<seconds>"
+    if (place.charAt(0) === 't') {
+      seek(Math.round(parseFloat(place.slice(1)) * 1000));
+      return;
+    }
+    var parts = place.split('/');
+    var segmentId = parts[0];
+    if (!segmentMap.segments[segmentId]) { playSegment(segmentMap.initialSegment); return; }
+    if (parts.length > 1) {
+      var m = (moments[segmentId] || [])[parseInt(parts[1], 10)];
+      if (m) { seek(m.startMs); return; }
+    }
+    seek(getSegmentMs(segmentId));
+  }
+
+  window.BandersnatchPlayer = BandersnatchPlayer;
+  window.__bnd = {
+    getSegmentId: getSegmentId, getSegmentMs: getSegmentMs, getMoments: getMoments,
+    playSegment: function (id) { segmentTransition = true; return playSegment(id); },
+    playNextSegment: playNextSegment, choose: choose, seek: seek,
+    onTimeUpdate: onTimeUpdate, jumpForward: jumpForward, jumpBack: jumpBack,
+    getSegment: function () { return currentSegment; },
+    getState: function () { return { segment: currentSegment, prev: prevSegment, ms: getCurrentMs() }; },
+    reset: function () { clearState(); location.hash = ''; location.reload(); },
+    data: { segmentMap: segmentMap, moments: moments, segmentGroups: segmentGroups,
+            choicePoints: choicePoints, interactive: interactive }
+  };
+}());
