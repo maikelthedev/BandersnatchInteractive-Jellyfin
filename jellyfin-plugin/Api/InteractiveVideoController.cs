@@ -126,6 +126,12 @@ namespace Jellyfin.Plugin.InteractiveVideo.Api
                     case "english":
                         resourceName = "Jellyfin.Plugin.InteractiveVideo.Web.english-subtitles.vtt";
                         break;
+                    case "es":
+                    case "es-es":
+                    case "spanish":
+                    case "espanol":
+                        resourceName = "Jellyfin.Plugin.InteractiveVideo.Web.spanish-subtitles.vtt";
+                        break;
                     default:
                         return NotFound($"Subtitle language '{language}' not available");
                 }
@@ -139,8 +145,9 @@ namespace Jellyfin.Plugin.InteractiveVideo.Api
                 using var reader = new StreamReader(stream);
                 var content = reader.ReadToEnd();
                 
-                Response.Headers.Add("Content-Type", "text/vtt; charset=utf-8");
-                return Content(content, "text/vtt");
+                // Setting it twice (header + Content) throws on a duplicate key,
+                // so the charset goes through the result instead.
+                return Content(content, "text/vtt; charset=utf-8");
             }
             catch (Exception ex)
             {
