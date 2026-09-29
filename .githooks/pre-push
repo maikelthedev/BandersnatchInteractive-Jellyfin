@@ -1,0 +1,58 @@
+#!/bin/sh
+#
+# Block a push that would publish a credential.
+#
+# Git only runs hooks from .git/hooks unless core.hooksPath says otherwise, so
+# activate this once per clone:
+#
+#     git config core.hooksPath .githooks
+#
+# The whole history is scanned, every ref, because a secret on any branch is a
+# secret in the repository (on a re-clone it comes back).  Overrides, both
+# deliberate: `git push --no-verify`, or TRUFFLEHOG_SKIP=1.
+
+set -u
+
+if [ "${TRUFFLEHOG_SKIP:-0}" = "1" ]; then
+  echo "trufflehog: skipped because TRUFFLEHOG_SKIP=1" >&2
+  exit 0
+fi
+
+remote_name="${1:-origin}"
+remote_url="${2:-}"
+
+if ! command -v trufflehog >/dev/null 2>&1; then
+  echo "trufflehog: not installed, so this push cannot be checked for secrets." >&2
+  echo "            install it (nix shell nixpkgs#trufflehog) and push again," >&2
+  echo "            or override this check with: git push --no-verify" >&2
+  exit 1
+fi
+
+# Git runs the hook from the top of the working tree, but do not rely on it.
+root=$(git rev-parse --show-toplevel 2>/dev/null) || root=$PWD
+
+# The nix launcher is a script that already passes --no-update (passing it
+# twice makes trufflehog exit with "flag cannot be repeated"); a plain binary
+# wants it so a push never triggers a self-update.
+th_bin=$(command -v trufflehog)
+no_update="--no-update"
+if [ "$(head -c 2 "$th_bin" 2>/dev/null)" = "#!" ] && grep -q -- "--no-update" "$th_bin" 2>/dev/null; then
+  no_update=""
+fi
+
+echo "trufflehog: scanning the history of ${remote_name}${remote_url:+ ($remote_url)}..." >&2
+
+if ! trufflehog git "file://$root" $no_update --fail; then
+  echo "" >&2
+  echo "  Push aborted: trufflehog reported a secret in this repository." >&2
+  echo "" >&2
+  echo "  Fix it properly - rotate the credential first, then rewrite the history" >&2
+  echo "  (git filter-repo / BFG) and force-push; deleting the file in a new commit" >&2
+  echo "  does not remove it.  If it is a false positive, or you know exactly what" >&2
+  echo "  you are doing:" >&2
+  echo "      git push --no-verify          # skip this hook for one push" >&2
+  echo "      TRUFFLEHOG_SKIP=1 git push    # same, spelled out" >&2
+  exit 1
+fi
+
+echo "trufflehog: no secrets found" >&2
