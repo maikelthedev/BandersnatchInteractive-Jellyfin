@@ -13,7 +13,11 @@
 
   var DEBUG = /[?&]debug=1/.test(location.search);
   var VIDEO_ID = '80988062';           // Netflix id of the interactive manifest
-  var SUBTITLE_URL = '/InteractiveVideo/Subtitles/en';
+  // Subtitle tracks in the order S cycles through them.
+  var SUBTITLES = [
+    { lang: 'es', label: 'Español', src: '/InteractiveVideo/Subtitles/es' },
+    { lang: 'en', label: 'English', src: '/InteractiveVideo/Subtitles/en' }
+  ];
   var RESUME = true;                   // remember where we were across sessions
 
   /* ------------------------------------------------------------------ data */
@@ -574,12 +578,39 @@
     else if (el.requestFullscreen) { el.requestFullscreen(); }
   }
 
-  function toggleSubtitles() {
-    var tracks = video.textTracks;
-    if (!tracks || !tracks.length) { return; }
-    var t = tracks[0];
-    t.mode = t.mode === 'showing' ? 'hidden' : 'showing';
-    toast('subtitles ' + (t.mode === 'showing' ? 'on' : 'off'));
+  // S walks off -> Español -> English -> off, and says which one it landed on.
+  function cycleSubtitles() {
+    var tracks = video.textTracks || [];
+    var current = null;
+    var i;
+    for (i = 0; i < tracks.length; i++) {
+      if (tracks[i].mode === 'showing') { current = tracks[i].language || null; }
+    }
+    var next = null;
+    if (current === null) {
+      next = SUBTITLES[0].lang;
+    } else {
+      for (i = 0; i < SUBTITLES.length; i++) {
+        if (SUBTITLES[i].lang === current) {
+          next = i + 1 < SUBTITLES.length ? SUBTITLES[i + 1].lang : null;
+          break;
+        }
+      }
+      if (i === SUBTITLES.length) { next = SUBTITLES[0].lang; }
+    }
+    for (i = 0; i < tracks.length; i++) {
+      tracks[i].mode = tracks[i].language === next ? 'showing' : 'hidden';
+    }
+    toast(next ? subtitleLabel(next) : 'Subtitles off');
+    updateHud();
+    return next;
+  }
+
+  function subtitleLabel(lang) {
+    for (var i = 0; i < SUBTITLES.length; i++) {
+      if (SUBTITLES[i].lang === lang) { return SUBTITLES[i].label; }
+    }
+    return lang;
   }
 
   function restart() { pendingTarget = null; pendingFrom = null; playSegment(segmentMap.initialSegment); video.play(); }
@@ -591,7 +622,7 @@
     switch (e.code) {
       case 'KeyF': toggleFullscreen(); break;
       case 'KeyR': restart(); break;
-      case 'KeyS': toggleSubtitles(); break;
+      case 'KeyS': cycleSubtitles(); break;
       case 'KeyD': DEBUG = !DEBUG; toast('debug ' + (DEBUG ? 'on' : 'off')); break;
       case 'Digit0': setSpeed(3); break;
       case 'Space': if (!choiceMode) { if (video.paused) { video.play(); } else { video.pause(); } } break;
@@ -655,12 +686,15 @@
       showMessage('Playback error' + (err ? ' (' + err.code + '): ' + err.message : ''));
     });
 
-    var track = document.createElement('track');
-    track.kind = 'subtitles';
-    track.label = 'English';
-    track.srclang = 'en';
-    track.src = SUBTITLE_URL;
-    video.appendChild(track);
+    var track; // eslint-disable-next-line no-var
+    for (var s = 0; s < SUBTITLES.length; s++) {
+      track = document.createElement('track');
+      track.kind = 'subtitles';
+      track.label = SUBTITLES[s].label;
+      track.srclang = SUBTITLES[s].lang;
+      track.src = SUBTITLES[s].src;
+      video.appendChild(track);
+    }
 
     startEl.addEventListener('click', function () {
       startEl.className = 'hide';
