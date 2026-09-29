@@ -16,6 +16,34 @@ An interactive video player plugin for Jellyfin that enables choice-based naviga
 - 💾 **State Persistence**: Remembers your choices and progress across sessions
 - 🏪 **Plugin Repository**: Easy installation via Jellyfin's plugin repository system
 
+## Build notes (this fork)
+
+Upstream was written against Jellyfin 10.8 and only ever shipped a five-choice stub
+of the interactive manifest, so on a current server it could not branch the story.
+This fork was rebuilt and reworked against a live **Jellyfin 12.1**:
+
+* **Real branching.** `Web/bandersnatch.js` + `Web/SegmentMap.js` carry the full
+  interactive manifest (250 segments, 174 choice moments, 241 preconditions, 111
+  segment groups) and `Web/interactive-player.js` implements the engine: segment
+  transitions, moments, preconditions, segment groups, breadcrumbs, persistent
+  state, and the deferred-vs-immediate choice semantics of the original player.
+* **Streams from Jellyfin.** The player asks the API for the item's MediaSources,
+  scores them (H.264/MP4 first, HEVC last) and plays
+  `/Videos/{id}/stream?static=true`, so the browser gets a rendition it can decode.
+* **ABI.** The project targets `net10.0`. Built on a machine that runs Jellyfin it
+  references that server's own assemblies (`build.sh` discovers them); otherwise
+  (CI, plain `dotnet build`) it restores the `Jellyfin.Controller` /
+  `Jellyfin.Model` 12.1.0 packages.
+* **The video must be the 5:12:14 "all endings" master** whose timeline matches the
+  segment map. A 10-bit HEVC release will not play in Chromium on Linux (no
+  software HEVC decoder, and no VA-API driver on many desktops), so keep an H.264
+  rendition in the library — the player picks it automatically when both exist.
+* `jellyfin-plugin/test-engine.js` (node) walks the whole story graph against the
+  real data and asserts every automatic transition is a legal successor.
+
+Player URL: `/InteractiveVideo/Player/{ItemId}`, with deep links
+`#<segmentId>`, `#<segmentId>/<momentIndex>` and `#t<seconds>`.
+
 ## 🎮 Keyboard Controls
 
 | Key | Function |
